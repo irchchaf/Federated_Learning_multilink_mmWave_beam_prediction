@@ -1,0 +1,113 @@
+# Beam Mapping (3.5GHz to 28GHz) with FL for 4 Cells
+# --------------------Import libraries--------------------
+import h5py
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, losses
+from sklearn.model_selection import train_test_split
+
+# ---------------------- System Parameters ----------------------
+NOISE_VARIANCE = 10 ** (-9)  # Noise variance
+TRANSMIT_POWER = 2.8262  # Total transmitted power (30 dBm = 1 W)
+NB_SUBCARRIERS = 512  # OFDM Subcarriers
+BANDWIDTH = 500e6 / NB_SUBCARRIERS  # Channel bandwidth per subcarrier
+NOISE_POWER_DB = -174 + 10 * np.log10(BANDWIDTH)  # Noise Power in dB
+NOISE_POWER = 10 ** (NOISE_POWER_DB / 10)  # Noise Power
+
+# ---------------------- Dataset Functions ----------------------
+def load_dataset(filepath, input_key, output_key):
+    with h5py.File(filepath, 'r') as f:
+        X = np.array(f[input_key]).astype(np.float32)
+        Y = np.array(f[output_key]).astype(np.float32)
+    X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.20, random_state=42)
+    X_train, X_val, Y_train, Y_val = train_test_split(X_train, Y_train, test_size=0.15, random_state=42)
+    return X_train, X_val, X_test, Y_train, Y_val, Y_test
+
+def add_noise(data, noise_var=NOISE_VARIANCE):
+    return data + (np.sqrt(noise_var) * np.random.normal(size=data.shape))
+
+# ---------------------- Load Datasets ----------------------
+datasets = {
+    "Tx1": load_dataset('DatasetMC1.mat', 'DatasetMC1/input1', 'DatasetMC1/output1'),
+    "Tx2": load_dataset('DatasetMC4.mat', 'DatasetMC4/input4', 'DatasetMC4/output4'),
+    "Tx3": load_dataset('DatasetMC6.mat', 'DatasetMC6/input6', 'DatasetMC6/output6'),
+    "Tx4": load_dataset('DatasetMC7.mat', 'DatasetMC7/input7', 'DatasetMC7/output7')
+}
+
+for key in datasets:
+    datasets[key] = tuple(add_noise(data) if 'X' in var else data for var, data in zip(
+        ['X_train', 'X_val', 'X_test', 'Y_train', 'Y_val', 'Y_test'], datasets[key]
+    ))
+
+# ---------------------- Custom Loss Function -----------------
+class AvgRateLoss(losses.Loss):
+    def call(self, y_true, y_pred):
+        y_pred = tf.complex(y_pred[:, :64], y_pred[:, 64:])
+        y_pred = tf.expand_dims(y_pred, -1)
+        y_true = tf.complex(y_true[:, :64, :], y_true[:, 64:, :])
+        snr = TRANSMIT_POWER / (32 * NOISE_POWER) * tf.pow(tf.abs(tf.matmul(y_true, y_pred, adjoint_a=True)), 2.0)
+        return -tf.reduce_mean(tf.math.log(1.0 + snr) / tf.math.log(2.0))
+
+# ---------------------- Define Model ----------------------
+def create_model():
+    model = tf.keras.Sequential([
+        layers.Flatten(),  
+        layers.BatchNormalization(),
+        layers.Dense(1024, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-8)),
+        layers.Dense(2048, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-8)),
+        layers.Dense(2048, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-8)),
+        layers.Dense(1024, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-8)),
+        layers.Dense(128, kernel_regularizer=tf.keras.regularizers.l2(1e-8)),
+        layers.Lambda(lambda x: tf.keras.backend.l2_normalize(x, axis=1))
+    ])
+    return model
+
+global_model = create_model()
+global_model.compile(optimizer=tf.keras.optimizers.Adam(0.0001), loss=AvgRateLoss())
+
+# ---------------------- FL Functions ----------------------
+def scale_model_weights(weight, scalar):
+    return [scalar * w for w in weight]
+
+def sum_scaled_weights(scaled_weight_list):
+    return [tf.reduce_sum(w, axis=0) for w in zip(*scaled_weight_list)]
+
+# ---------------------- FL Training ----------------------
+comms_rounds = 100
+dev_nbr = 4
+data_sizes = [datasets[tx][0].shape[0] for tx in datasets]
+total_data = sum(data_sizes)
+
+for comm_round in range(comms_rounds):
+    print(f'FL Communication Round {comm_round + 1}/{comms_rounds}')
+    scaled_local_weight_list = []
+    train_losses = []
+    val_losses = []
+
+    for i, (tx, (X_train, X_val, X_test, Y_train, Y_val, Y_test)) in enumerate(datasets.items()):
+        print(f"Training on {tx}...")
+        local_model = create_model()
+        local_model.set_weights(global_model.get_weights())
+        history = local_model.fit(X_train, Y_train, validation_data=(X_val, Y_val), epochs=1, batch_size=32, verbose=0)
+        
+        train_loss = history.history['loss'][-1]
+        val_loss = history.history['val_loss'][-1]
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        
+        print(f"Train Loss on {tx}: {train_loss:.4f} | Validation Loss: {val_loss:.4f}")
+        
+        scaling_factor = data_sizes[i] / total_data
+        scaled_weights = scale_model_weights(local_model.get_weights(), scaling_factor)
+        scaled_local_weight_list.append(scaled_weights)
+    
+    aggregated_weights = sum_scaled_weights(scaled_local_weight_list)
+    global_model.set_weights(aggregated_weights)
+    
+# Save the FL model
+global_model.save('savedmodelSFL')
+
+print("Federated Learning Training Complete, Global model saved")
+
+
+
